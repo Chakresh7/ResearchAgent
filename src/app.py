@@ -1,6 +1,5 @@
-from tools.tools import tavily_search, scrape_website, extract_text
-from rich import print
+from pipelines.pipeline import run_research_agent
 
-result = tavily_search.invoke({"query": "What is the capital of France?"})
+topic = "The Impact of Ai in the Job Market in 2027"
 
-print(result)
+run_research_agent(topic=topic)

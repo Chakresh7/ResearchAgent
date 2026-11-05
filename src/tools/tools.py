@@ -19,16 +19,46 @@ _MAX_RESPONSE_BYTES = 2_000_000
 _MAX_EXTRACTED_CHARS = 12_000
 _MIN_USEFUL_CHARS = 80
 
-_BROWSER_HEADERS = {
-    "User-Agent": (
+_USER_AGENTS = (
+    (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-}
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+    ),
+)
+
+
+def _headers_for(url: str, attempt: int = 0) -> dict[str, str]:
+    """Browser-like headers. A second attempt uses a Google referer."""
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    referer = "https://www.google.com/" if attempt else f"{origin}/"
+    fetch_site = "cross-site" if attempt else "none"
+
+    return {
+        "User-Agent": _USER_AGENTS[min(attempt, len(_USER_AGENTS) - 1)],
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "max-age=0",
+        "Connection": "keep-alive",
+        "Referer": referer,
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": fetch_site,
+        "Sec-Fetch-User": "?1",
+        "Sec-CH-UA": '"Chromium";v="131", "Not_A Brand";v="24"',
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"Windows"',
+    }
 
 _client: TavilyClient | None = None
 
@@ -143,52 +173,28 @@ def _format_search_results(query: str, response: dict) -> str:
     return _truncate("\n\n".join(sections), limit=8_000)
 
 
-def _fetch_page(url: str) -> tuple[str, str] | str:
-    """Return (final_url, html) or an error string."""
-    try:
-        with requests.get(
-            url,
-            headers=_BROWSER_HEADERS,
-            timeout=_REQUEST_TIMEOUT,
-            allow_redirects=True,
-            stream=True,
-        ) as response:
-            response.raise_for_status()
+def _read_response(response: requests.Response, url: str) -> tuple[str, str] | str:
+    content_type = (response.headers.get("Content-Type") or "").lower()
+    if content_type and not any(
+        kind in content_type for kind in ("html", "xml", "text/plain")
+    ):
+        return (
+            f"Error: {url} is not an HTML page "
+            f"(content type: {content_type.split(';')[0].strip()})."
+        )
 
-            content_type = (response.headers.get("Content-Type") or "").lower()
-            if content_type and not any(
-                kind in content_type for kind in ("html", "xml", "text/plain")
-            ):
-                return (
-                    f"Error: {url} is not an HTML page "
-                    f"(content type: {content_type.split(';')[0].strip()})."
-                )
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=65_536):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > _MAX_RESPONSE_BYTES:
+            break
+        chunks.append(chunk)
 
-            chunks: list[bytes] = []
-            total = 0
-            for chunk in response.iter_content(chunk_size=65_536):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > _MAX_RESPONSE_BYTES:
-                    break
-                chunks.append(chunk)
-
-            raw = b"".join(chunks)
-            encoding = response.encoding or "utf-8"
-            final_url = response.url or url
-    except requests.Timeout:
-        return f"Error: timed out while fetching {url}."
-    except requests.TooManyRedirects:
-        return f"Error: too many redirects for {url}."
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "unknown"
-        return f"Error: failed to fetch {url} (HTTP {status})."
-    except requests.ConnectionError:
-        return f"Error: could not connect to {url}. Check the address and try again."
-    except requests.RequestException:
-        return f"Error: could not fetch {url}."
-
+    raw = b"".join(chunks)
+    encoding = response.encoding or "utf-8"
     try:
         html = raw.decode(encoding, errors="replace")
     except LookupError:
@@ -197,7 +203,46 @@ def _fetch_page(url: str) -> tuple[str, str] | str:
     if not html.strip():
         return f"Error: {url} returned an empty page."
 
-    return final_url, html
+    return response.url or url, html
+
+
+def _fetch_page(url: str) -> tuple[str, str] | str:
+    """Return (final_url, html) or an error string.
+
+    A 403 is retried once with a second browser profile and a Google referer.
+    """
+    last_status: int | str | None = None
+
+    for attempt in range(2):
+        try:
+            with requests.get(
+                url,
+                headers=_headers_for(url, attempt),
+                timeout=_REQUEST_TIMEOUT,
+                allow_redirects=True,
+                stream=True,
+            ) as response:
+                if response.status_code in {403, 429} and attempt == 0:
+                    last_status = response.status_code
+                    continue
+                response.raise_for_status()
+                return _read_response(response, url)
+        except requests.Timeout:
+            return f"Error: timed out while fetching {url}."
+        except requests.TooManyRedirects:
+            return f"Error: too many redirects for {url}."
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            last_status = status
+            if status in {403, 429} and attempt == 0:
+                continue
+            return f"Error: failed to fetch {url} (HTTP {status})."
+        except requests.ConnectionError:
+            return f"Error: could not connect to {url}. Check the address and try again."
+        except requests.RequestException:
+            return f"Error: could not fetch {url}."
+
+    return f"Error: failed to fetch {url} (HTTP {last_status or 403})."
 
 
 def _scrape(url: str) -> str:
